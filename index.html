@@ -310,6 +310,7 @@
         let heroKickoff = null;
         let heroMatchId = null;
         let activeMatchObj = null;
+        let selectedChannel = null;
         let liveRefreshStarted = false;
 
         const LIVE_REFRESH_MS = 10000;
@@ -357,15 +358,15 @@
                 homeFlag: "us",
                 awayTeam: "Australia",
                 awayFlag: "au",
-                kickoffUTC: new Date(Date.now() - 30 * 60 * 1000).toISOString(), // Started 30 mins ago (Live now!)
+                kickoffUTC: new Date(Date.now() + 90 * 60 * 1000).toISOString(), // Fallback only: never fake a live match
                 venue: "Lumen Field",
-                homeScore: 2,
-                awayScore: 1,
-                minute: 35,
-                clockDisplay: "35'",
-                hasRealScore: true,
-                hasRealClock: true,
-                status: "live"
+                homeScore: null,
+                awayScore: null,
+                minute: null,
+                clockDisplay: "",
+                hasRealScore: false,
+                hasRealClock: false,
+                status: "scheduled"
             },
             {
                 id: "match-2",
@@ -754,12 +755,23 @@
             };
         }
 
-        // Modified: A match is live if current time is equal or past the kickoff but not finished
+        // A match is live only when the API says it is live, or when it is inside the kickoff window.
+        // Explicit "scheduled/pre" statuses always win so old/fake fallback games do not stay pinned.
         function isLiveMatch(match, now = Date.now()) {
             if (!match || isFinishedMatch(match, now)) return false;
             const kickoff = new Date(match.kickoffUTC).getTime();
             if (!Number.isFinite(kickoff)) return false;
-            return statusLooksLive(match.status) || now >= kickoff;
+
+            if (statusLooksLive(match.status)) return true;
+            if (statusLooksScheduled(match.status)) return false;
+
+            const insideWindow = now >= kickoff && now <= kickoff + fallbackMatchDurationMs(match);
+            if (!insideWindow) return false;
+
+            // If an API gives a real clock, treat it as live. Otherwise only use the kickoff window
+            // for schedule rows with no explicit status.
+            if (match.hasRealClock || !!getClockDisplay(match.clockDisplay)) return true;
+            return !getCleanString(match.status);
         }
 
         function getDisplayScore(value) {
@@ -778,10 +790,17 @@
         function selectSpotlightMatch(fixtures) {
             const now = Date.now();
             const visible = fixtures
-                .filter((match) => match && match.kickoffUTC && !isFinishedMatch(match, now))
+                .filter((match) => match && match.kickoffUTC && !isFinishedMatch(match, now));
+
+            const live = visible
+                .filter((match) => isLiveMatch(match, now))
+                .sort((a, b) => getLiveMatchPriority(b, now) - getLiveMatchPriority(a, now));
+
+            const upcoming = visible
+                .filter((match) => !isLiveMatch(match, now) && new Date(match.kickoffUTC).getTime() > now)
                 .sort((a, b) => new Date(a.kickoffUTC) - new Date(b.kickoffUTC));
-            const live = visible.filter((match) => isLiveMatch(match, now));
-            return live[0] || visible.find((match) => new Date(match.kickoffUTC).getTime() > now) || fixtures[0] || null;
+
+            return live[0] || upcoming[0] || visible.sort((a, b) => new Date(a.kickoffUTC) - new Date(b.kickoffUTC))[0] || null;
         }
 
         function renderHeroFlag(elementId, match, side) {
@@ -826,6 +845,9 @@
         function setHeroMatch(match) {
             if (!match) return;
 
+            const previousHeroId = heroMatchId;
+            const changedMatch = previousHeroId && previousHeroId !== match.id;
+
             activeMatchObj = match;
             heroMatchId = match.id;
             heroKickoff = new Date(match.kickoffUTC);
@@ -840,6 +862,15 @@
             renderHeroFlag('hero-home-flag', match, 'home');
             renderHeroFlag('hero-away-flag', match, 'away');
             setHeroCenter(match);
+            updateStreamMatchTitle();
+
+            // If the user is already watching and the live fixture changes, reload the stream URL
+            // using the same selected server so it follows the current game automatically.
+            if (changedMatch && !streamTheater.classList.contains('hidden')) {
+                populateCustomDropdown();
+                selectServer(selectedChannel || SERVER_CHANNELS[0]);
+            }
+
             runMainCountdown();
         }
 
@@ -1024,17 +1055,14 @@
 
         function globalClockTick() {
             if (matchesData.length) {
+                const bestHero = selectSpotlightMatch(matchesData);
                 const currentHero = matchesData.find((match) => match.id === heroMatchId);
-                if (currentHero) {
-                    if (isFinishedMatch(currentHero)) {
-                        // Match finished, dynamically target the next spotlight game
-                        const nextHero = selectSpotlightMatch(matchesData);
-                        if (nextHero && nextHero.id !== heroMatchId) {
-                            setHeroMatch(nextHero);
-                        }
-                    } else {
-                        setHeroCenter(currentHero);
-                    }
+
+                if (bestHero && bestHero.id !== heroMatchId) {
+                    setHeroMatch(bestHero);
+                } else if (currentHero) {
+                    setHeroCenter(currentHero);
+                    updateStreamMatchTitle();
                 }
             }
 
@@ -1089,8 +1117,16 @@
             });
         }
 
+        function updateStreamMatchTitle() {
+            if (!streamMatchTitle || !activeMatchObj) return;
+            const home = normalizeTeamName(activeMatchObj.homeTeam);
+            const away = normalizeTeamName(activeMatchObj.awayTeam);
+            streamMatchTitle.innerText = `${home} VS ${away}`;
+        }
+
         function selectServer(chan) {
-            if (!activeMatchObj) return;
+            if (!activeMatchObj || !chan) return;
+            selectedChannel = chan;
 
             const homeSlug = normalizeCountryKey(activeMatchObj.homeTeam).replace(/\s+/g, '-');
             const awaySlug = normalizeCountryKey(activeMatchObj.awayTeam).replace(/\s+/g, '-');
@@ -1165,12 +1201,10 @@
             populateCustomDropdown();
 
             // Setup matchup title at the top header
-            const home = normalizeTeamName(activeMatchObj.homeTeam);
-            const away = normalizeTeamName(activeMatchObj.awayTeam);
-            streamMatchTitle.innerText = `${home} VS ${away}`;
+            updateStreamMatchTitle();
 
-            // Default to English Live Feed (HD) (Server 1)
-            const defaultChan = SERVER_CHANNELS[0];
+            // Default to English Live Feed (HD) (Server 1), or keep the user's last server choice.
+            const defaultChan = selectedChannel || SERVER_CHANNELS[0];
             selectServer(defaultChan);
 
             // View transitions
@@ -1324,6 +1358,11 @@
             if (statusLooksFinished(match.status)) return true;
             const kickoff = new Date(match.kickoffUTC).getTime();
             if (!Number.isFinite(kickoff)) return true;
+
+            // If an API still says pre/scheduled after kickoff, do not let that stale item
+            // take over the hero card. Real live APIs should mark it live or provide a clock.
+            if (statusLooksScheduled(match.status) && now > kickoff + 15 * 60 * 1000) return true;
+
             return now > kickoff + fallbackMatchDurationMs(match);
         }
 
@@ -1334,14 +1373,29 @@
         function statusLooksLive(status) {
             const raw = getCleanString(status).toLowerCase();
             if (!raw) return false;
-            return /\b(live|in|in progress|first half|second half|1st half|2nd half|halftime|half time|ht|extra time|penalties?)\b/.test(raw)
+            return /\b(live|in[-\s]?progress|first half|second half|1st half|2nd half|halftime|half time|ht|extra time|penalties?|status_in_progress)\b/.test(raw)
                 && !statusLooksFinished(raw);
+        }
+
+        function statusLooksScheduled(status) {
+            const raw = getCleanString(status).toLowerCase();
+            if (!raw) return false;
+            return /\b(scheduled|pre|pre-game|pregame|not started|not-started|upcoming|fixture|created|status_scheduled|status_pre)\b/.test(raw);
+        }
+
+        function getLiveMatchPriority(match, now = Date.now()) {
+            const kickoff = new Date(match.kickoffUTC).getTime();
+            const explicitLive = statusLooksLive(match.status) ? 1000000000000 : 0;
+            const realClock = (match.hasRealClock || !!getClockDisplay(match.clockDisplay)) ? 500000000000 : 0;
+            const realScore = (match.hasRealScore && match.homeScore !== null && match.awayScore !== null) ? 100000000000 : 0;
+            const startedRecently = Number.isFinite(kickoff) ? Math.max(0, 24 * 60 * 60 * 1000 - Math.abs(now - kickoff)) : 0;
+            return explicitLive + realClock + realScore + startedRecently;
         }
 
         function statusLooksFinished(status) {
             const raw = getCleanString(status).toLowerCase();
             if (!raw) return false;
-            return /\b(ft|full time|full-time|final|finished|ended|complete|completed|post|postponed|cancelled|canceled|abandoned)\b/.test(raw);
+            return /\b(ft|full time|full-time|final|finished|ended|end of game|complete|completed|post|status_final|status_full_time|postponed|cancelled|canceled|abandoned)\b/.test(raw);
         }
 
         function fallbackMatchDurationMs(match) {
@@ -1435,6 +1489,7 @@
         }
 
         async function refreshLiveData() {
+            const usingMockBase = !Array.isArray(baseFixtures) || !baseFixtures.length || baseFixtures === MOCK_FIXTURES;
             const safeBase = Array.isArray(baseFixtures) && baseFixtures.length ? baseFixtures : MOCK_FIXTURES;
             let liveFixtures = [];
             try {
@@ -1443,7 +1498,10 @@
                 liveFixtures = [];
             }
 
-            const merged = mergeLiveIntoBase(safeBase, liveFixtures);
+            // Important: if a live API returns actual games, do not let fallback/mock games
+            // compete for the hero slot. That was why USA vs Australia stayed pinned.
+            const baseForMerge = liveFixtures.length && usingMockBase ? [] : safeBase;
+            const merged = mergeLiveIntoBase(baseForMerge, liveFixtures);
             applySchedule(merged.length ? merged : safeBase);
         }
 
